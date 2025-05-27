@@ -1,0 +1,767 @@
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+import pandas as pd
+import logging
+import time
+from pathlib import Path
+from datetime import datetime
+import langdetect
+import os
+import re
+import threading
+import queue
+import concurrent.futures
+from tqdm import tqdm
+
+class ParallelBookDownloader:
+    def __init__(self, output_dir='english_fiction'):
+        self.output_dir = Path(output_dir)
+        self.books_dir = self.output_dir / "texts"
+        self.metadata_file = self.output_dir / "metadata.csv"
+        
+        # Create directories
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.books_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup logging
+        log_file = f'download_{datetime.now():%Y%m%d_%H%M}.log'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
+        logging.info(f"Инициализация загрузчика. Лог: {log_file}")
+        
+        # Исключаемые авторы
+        self.excluded_authors = {
+            # Русские авторы в переводе
+            'tolstoy', 'dostoevsky', 'dostoyevsky', 'turgenev', 'chekhov', 'gogol', 
+            'pushkin', 'zamyatin', 'bulgakov', 'gorky', 'nabokov', 'pasternak',
+            # Другие нежелательные авторы
+            'arnold bennett', 'gilbert keith chesterton', 'o. henry', 'jacob abbott',
+            'asimov', 'borges', 'stoker', 'shelley', 'wells', 'woolf', 'wilde', 
+            'kipling', 'machen', 'montgomery', 'bradbury', 'maugham', 'twain',
+            'joyce', 'conan doyle', 'nesbit', 'austen'
+        }
+        
+        # Индикаторы нежелательного контента
+        self.non_english_markers = {
+            'мы', 'евгений', 'иванович', 'русский', 'русская', 'россия',
+            'фёдор', 'алексей', 'антон', 'иван', 'лев', 'николай'
+        }
+        
+        # Потоки
+        self.lock = threading.Lock()
+        self.search_queue = queue.Queue()
+        self.download_queue = queue.Queue()
+        
+        # Данные
+        self.collected = []
+        self.existing_ids = set()
+        
+        # Счетчики для статистики
+        self.stats = {
+            'searched': 0,
+            'attempted': 0,
+            'downloaded': 0,
+            'excluded_authors': 0,
+            'excluded_language': 0,
+            'failed': 0
+        }
+        
+        # Загрузка существующего прогресса
+        if self.metadata_file.exists():
+            df = pd.read_csv(self.metadata_file)
+            with self.lock:
+                self.existing_ids = set(df['book_id'].astype(str))
+                self.collected = df.to_dict('records')
+                logging.info(f"Загружено {len(self.collected)} книг из существующего файла")
+
+    def _create_session(self):
+        """Create session with retry strategy for each thread"""
+        session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        
+        # Разные User-Agent для разных потоков
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0'
+        ]
+        session.headers.update({
+            'User-Agent': user_agents[int(threading.current_thread().name.split('-')[1]) % len(user_agents)]
+        })
+        return })
+return session
+ def _is_excluded_author(self, author):
+        """Check if author should be excluded"""
+        author_lower = author.lower()
+        for excluded in self.excluded_authors:
+            if excluded in author_lower:
+                with self.lock:
+                    self.stats['excluded_authors'] += 1
+                return True
+                
+        # Проверка на неанглийские маркеры в имени
+        for marker in self.non_english_markers:
+            if marker in author_lower:
+                with self.lock:
+                    self.stats['excluded_authors'] += 1
+                return True
+                
+        return False
+
+    def _is_english_book(self, title, subjects):
+        """Check if book is likely English fiction"""
+        title_lower = title.lower()
+        
+        # Проверка на неанглийские маркеры в названии
+        for marker in self.non_english_markers:
+            if marker in title_lower:
+                return False
+        
+        # Проверка на маркеры русской литературы
+        russian_book_markers = ['russian', 'russia', 'soviet', 'ussr', 'moscow', 'petersburg']
+        if any(marker in title_lower for marker in russian_book_markers):
+            return False
+            
+        # Проверка на художественную литературу
+        if subjects:
+            fiction_markers = ['fiction', 'novel', 'story', 'tales', 'literature']
+            has_fiction = any(any(marker in s.lower() for marker in fiction_markers) for s in subjects)
+            
+            if not has_fiction:
+                return False
+                
+        return True
+
+    def _check_language(self, text):
+        """Проверка языка текста на английский"""
+        try:
+            # Проверка на кириллицу
+            if re.search('[а-яА-Я]', text[:5000]):
+                return False
+            
+            # Выборка фрагментов для проверки
+            chunks = [
+                text[:2000],
+                text[len(text)//2:len(text)//2 + 2000] if len(text) > 4000 else text[2000:4000]
+            ]
+            
+            for chunk in chunks:
+                try:
+                    if langdetect.detect(chunk) != 'en':
+                        with self.lock:
+                            self.stats['excluded_language'] += 1
+                        return False
+                except:
+                    continue
+            
+            # Проверка частоты английских слов
+            english_words = {'the', 'and', 'to', 'of', 'a', 'in', 'that', 'is', 'was', 'he', 'for'}
+            sample = text[:5000].lower()
+            words = re.findall(r'\b\w+\b', sample)
+            
+            if len(words) > 100:
+                english_count = sum(1 for word in words if word in english_words)
+                ratio = english_count / len(words)
+                
+                if ratio < 0.1:  # Менее 10% распространенных английских слов
+                    with self.lock:
+                        self.stats['excluded_language'] += 1
+                    return False
+            
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка при проверке языка: {e}")
+            return False
+
+    def search_worker(self, years_range, thread_id):
+        """Worker thread for searching books"""
+        logging.info(f"Поисковый поток {thread_id} запущен. Годы: {years_range[0]}-{years_range[1]}")
+        session = self._create_session()
+        
+        # Более узкие поисковые запросы для каждого потока
+        search_queries = [
+            f'subject:"english fiction" AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:"english literature" AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:fiction AND language:eng AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:(novel OR fiction) AND language:eng AND first_publish_year:[{years_range[0]} TO {years_range[1]}]'
+        ]
+        
+        current_page = 1
+        query_index = 0
+        
+        while True:
+            try:
+                curr def _is_excluded_author(self, author):
+        """Check if author should be excluded"""
+        author_lower = author.lower()
+        for excluded in self.excluded_authors:
+            if excluded in author_lower:
+                with self.lock:
+                    self.stats['excluded_authors'] += 1
+                return True
+                
+        # Проверка на неанглийские маркеры в имени
+        for marker in self.non_english_markers:
+            if marker in author_lower:
+                with self.lock:
+                    self.stats['excluded_authors'] += 1
+                return True
+                
+        return False
+
+    def _is_english_book(self, title, subjects):
+        """Check if book is likely English fiction"""
+        title_lower = title.lower()
+        
+        # Проверка на неанглийские маркеры в названии
+        for marker in self.non_english_markers:
+            if marker in title_lower:
+                return False
+        
+        # Проверка на маркеры русской литературы
+        russian_book_markers = ['russian', 'russia', 'soviet', 'ussr', 'moscow', 'petersburg']
+        if any(marker in title_lower for marker in russian_book_markers):
+            return False
+            
+        # Проверка на художественную литературу
+        if subjects:
+            fiction_markers = ['fiction', 'novel', 'story', 'tales', 'literature']
+            has_fiction = any(any(marker in s.lower() for marker in fiction_markers) for s in subjects)
+            
+            if not has_fiction:
+                return False
+                
+        return True
+
+    def _check_language(self, text):
+        """Проверка языка текста на английский"""
+        try:
+            # Проверка на кириллицу
+            if re.search('[а-яА-Я]', text[:5000]):
+                return False
+            
+            # Выборка фрагментов для проверки
+            chunks = [
+                text[:2000],
+                text[len(text)//2:len(text)//2 + 2000] if len(text) > 4000 else text[2000:4000]
+            ]
+            
+            for chunk in chunks:
+                try:
+                    if langdetect.detect(chunk) != 'en':
+                        with self.lock:
+                            self.stats['excluded_language'] += 1
+                        return False
+                except:
+                    continue
+            
+            # Проверка частоты английских слов
+            english_words = {'the', 'and', 'to', 'of', 'a', 'in', 'that', 'is', 'was', 'he', 'for'}
+            sample = text[:5000].lower()
+            words = re.findall(r'\b\w+\b', sample)
+            
+            if len(words) > 100:
+                english_count = sum(1 for word in words if word in english_words)
+                ratio = english_count / len(words)
+                
+                if ratio < 0.1:  # Менее 10% распространенных английских слов
+                    with self.lock:
+                        self.stats['excluded_language'] += 1
+                    return False
+            
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка при проверке языка: {e}")
+            return False
+
+    def search_worker(self, years_range, thread_id):
+        """Worker thread for searching books"""
+        logging.info(f"Поисковый поток {thread_id} запущен. Годы: {years_range[0]}-{years_range[1]}")
+        session = self._create_session()
+        
+        # Более узкие поисковые запросы для каждого потока
+        search_queries = [
+            f'subject:"english fiction" AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:"english literature" AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:fiction AND language:eng AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:(novel OR fiction) AND language:eng AND first_publish_year:[{years_range[0]} TO {years_range[1]}]'
+        ]
+        
+        current_page = 1
+        query_index = 0
+        
+        while True:
+            try:
+                curr def _is_excluded_author(self, author):
+        """Check if author should be excluded"""
+        author_lower = author.lower()
+        for excluded in self.excluded_authors:
+            if excluded in author_lower:
+                with self.lock:
+                    self.stats['excluded_authors'] += 1
+                return True
+                
+        # Проверка на неанглийские маркеры в имени
+        for marker in self.non_english_markers:
+            if marker in author_lower:
+                with self.lock:
+                    self.stats['excluded_authors'] += 1
+                return True
+                
+        return False
+
+    def _is_english_book(self, title, subjects):
+        """Check if book is likely English fiction"""
+        title_lower = title.lower()
+        
+        # Проверка на неанглийские маркеры в названии
+        for marker in self.non_english_markers:
+            if marker in title_lower:
+                return False
+        
+        # Проверка на маркеры русской литературы
+        russian_book_markers = ['russian', 'russia', 'soviet', 'ussr', 'moscow', 'petersburg']
+        if any(marker in title_lower for marker in russian_book_markers):
+            return False
+            
+        # Проверка на художественную литературу
+        if subjects:
+            fiction_markers = ['fiction', 'novel', 'story', 'tales', 'literature']
+            has_fiction = any(any(marker in s.lower() for marker in fiction_markers) for s in subjects)
+            
+            if not has_fiction:
+                return False
+                
+        return True
+
+    def _check_language(self, text):
+        """Проверка языка текста на английский"""
+        try:
+            # Проверка на кириллицу
+            if re.search('[а-яА-Я]', text[:5000]):
+                return False
+            
+            # Выборка фрагментов для проверки
+            chunks = [
+                text[:2000],
+                text[len(text)//2:len(text)//2 + 2000] if len(text) > 4000 else text[2000:4000]
+            ]
+            
+            for chunk in chunks:
+                try:
+                    if langdetect.detect(chunk) != 'en':
+                        with self.lock:
+                            self.stats['excluded_language'] += 1
+                        return False
+                except:
+                    continue
+            
+            # Проверка частоты английских слов
+            english_words = {'the', 'and', 'to', 'of', 'a', 'in', 'that', 'is', 'was', 'he', 'for'}
+            sample = text[:5000].lower()
+            words = re.findall(r'\b\w+\b', sample)
+            
+            if len(words) > 100:
+                english_count = sum(1 for word in words if word in english_words)
+                ratio = english_count / len(words)
+                
+                if ratio < 0.1:  # Менее 10% распространенных английских слов
+                    with self.lock:
+                        self.stats['excluded_language'] += 1
+                    return False
+            
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка при проверке языка: {e}")
+            return False
+
+    def search_worker(self, years_range, thread_id):
+        """Worker thread for searching books"""
+        logging.info(f"Поисковый поток {thread_id} запущен. Годы: {years_range[0]}-{years_range[1]}")
+        session = self._create_session()
+        
+        # Более узкие поисковые запросы для каждого потока
+        search_queries = [
+            f'subject:"english fiction" AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:"english literature" AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:fiction AND language:eng AND first_publish_year:[{years_range[0]} TO {years_range[1]}]',
+            f'subject:(novel OR fiction) AND language:eng AND first_publish_year:[{years_range[0]} TO {years_range[1]}]'
+        ]
+        
+        current_page = 1
+        query_index = 0
+        
+        while True:
+            try:
+                current_query = search_queries[query_index % len(search_queries)]
+                
+                params = {
+                    'q': current_query,
+                    'has_fulltext': 'true',
+                    'fields': 'key,title,author_name,first_publish_year,subject',
+                    'limit': 100,
+                    'page': current_page
+                }
+                
+                # Добавляем случайную задержку для предотвращения блокировки
+                time.sleep(3 + (thread_id % 3))
+                
+                response = session.get('https://openlibrary.org/search.json', params=params, timeout=30)
+                
+                if not response.ok:
+                    logging.warning(f"Поток {thread_id}: Ошибка поиска: {response.status_code}")
+                    time.sleep(10)
+                    current_page += 1
+                    if current_page > 10:
+                        current_page = 1
+                        query_index += 1
+                    continue
+                    
+                data = response.json()
+                docs = data.get('docs', [])
+                
+                if not docs:
+                    logging.info(f"Поток {thread_id}: Нет результатов. Переход к следующему запросу")
+                    query_index += 1
+                    current_page = 1
+                    if query_index >= len(search_queries) * 2:
+                        break  # Все запросы исчерпаны
+                    continue
+                
+                with self.lock:
+                    self.stats['searched'] += len(docs)
+                
+                for book in docs:
+                    book_id = book['key'].replace('/works/', '')
+                    
+                    # Пропускаем уже скачанные книги
+                    with self.lock:
+                        if book_id in self.existing_ids:
+                            continue
+                    
+                    title = book.get('title', 'Unknown')
+                    author = book.get('author_name', ['Unknown'])[0] if book.get('author_name') else 'Unknown'
+                    subjects = book.get('subject', [])
+                    year = book.get('first_publish_year', 0)
+                    
+                    # Проверка года публикации
+                    if not (years_range[0] <= year <= years_range[1]):
+                        continue
+                        
+                    # Проверка автора
+                    if self._is_excluded_author(author):
+                        continue
+                        
+                    # Проверка названия и тематики
+                    if not self._is_english_book(title, subjects):
+                        continue
+                    
+                    # Добавление книги в очередь на скачивание
+                    self.download_queue.put((book_id, title, author, year, subjects))
+                
+                current_page += 1
+                if current_page > 30:  # Ограничение на глубину поиска
+                    current_page = 1
+                    query_index += 1
+                
+            except Exception as e:
+                logging.error(f"Поток {thread_id}: Ошибка при поиске: {e}")
+                time.sleep(5)
+                current_page += 1
+        
+        logging.info(f"Поисковый поток {thread_id} завершен")
+
+    def download_worker(self, thread_id):
+        """Worker thread for downloading books"""
+        logging.info(f"Поток загрузки {thread_id} запущен")
+        session = self._create_session()
+        
+        while True:
+            try:
+                # Получение следующей книги из очереди с таймаутом
+                try:
+                    book_id, title, author, year, subjects = self.download_queue.get(timeout=120)
+                except queue.Empty:
+                    logging.info(f"Поток {thread_id}: Очередь пуста, ожидание...")
+                    time.sleep(10)
+                    continue
+
+                with self.lock:
+                    # Пропускаем, если уже добавлена другим потоком
+                    if book_id in self.existing_ids:
+                        self.download_queue.task_done()
+                        continue
+                    # Помечаем как обрабатываемую
+                    self.existing_ids.add(book_id)
+                    self.stats['attempted'] += 1
+                
+                logging.info(f"Поток {thread_id}: Загрузка '{title}' ({year})")
+                
+                # Получаем информацию о изданиях
+                text, archive_id = None, None
+                try:
+                    editions_url = f"https://openlibrary.org/works/{book_id}/editions.json"
+                    time.sleep(2)
+                    response = session.get(editions_url, timeout=30)
+                    
+                    if response.ok:
+                        editions = response.json().get('entries', [])
+                        
+                        for edition in editions:
+                            if 'ocaid' not in edition:
+                                continue
+                                
+                            archive_id = edition['ocaid']
+                            
+                            # Пробуем различные форматы текста
+                            text_formats = [
+                                f"https://archive.org/download/{archive_id}/{archive_id}_djvu.txt",
+                                f"https://archive.org/download/{archive_id}/{archive_id}_utf8.txt",
+                                f"https://archive.org/download/{archive_id}/page/n0/mode/1up?view=theater&output=txt"
+                            ]
+                            
+                            for text_url in text_formats:
+                                time.sleep(2)
+                                try:
+                                    response = session.get(text_url, timeout=30)
+                                    
+                                    if response.ok:
+                                        text = response.text
+                                        
+                                        # Проверка на HTML или короткий текст
+                                        if text.startswith('<!DOCTYPE') or '<html' in text.lower() or len(text.strip()) < 1000:
+                                            text = None
+                                            continue
+                                        
+                                        # Проверка языка
+                                        if self._check_language(text):
+                                            break
+                                        else:
+                                            text = None
+                                except Exception as e:
+                                    logging.error(f"Поток {thread_id}: Ошибка при загрузке {text_url}: {e}")
+                                    continue
+                                    
+                            if text:
+                                break
+                except Exception as e:
+                    logging.error(f"Поток {thread_id}: Ошибка при получении изданий для {book_id}: {e}")
+                
+                if not text:
+                    with self.lock:
+                        self.stats['failed'] += 1
+                        # Разблокируем ID для повторной попытки другим потоком
+                        self.existing_ids.remove(book_id)
+                    self.download_queue.task_done()
+                    continue
+                
+                # Создание имени файла
+                safe_title = re.sub(r'[^\w\s-]', '', title).replace(' ', '_')[:80]
+                safe_author = re.sub(r'[^\w\s-]', '', author).replace(' ', '_')[:40]
+                filename = f"{safe_author}__{safe_title}__{year}.txt"
+                
+                # Сохранение текста
+                book_path = self.books_dir / filename
+                try:
+                    with open(book_path, 'w', encoding='utf-8') as f:
+                        f.write(text)
+                    
+                    # Сохранение метаданных
+                    metadata = {'book_id': book_id,
+                        'title': title,
+                        'author': author,
+                        'year': year,
+                        'archive_id': archive_id,
+                        'filename': filename,
+                        'word_count': len(text.split())
+                    }
+                    
+                    with self.lock:
+                        self.collected.append(metadata)
+                        self.stats['downloaded'] += 1
+                    
+                    if thread_id == 1:  # Только один поток сохраняет прогресс
+                        self._save_progress()
+                    
+                    logging.info(f"Поток {thread_id}: Успешно загружена книга '{title}' - {len(text.split())} слов")
+                except Exception as e:
+                    logging.error(f"Поток {thread_id}: Ошибка при сохранении {filename}: {e}")
+                    with self.lock:
+                        self.stats['failed'] += 1
+                        self.existing_ids.remove(book_id)
+                
+                self.download_queue.task_done()
+                
+            except Exception as e:
+                logging.error(f"Поток {thread_id}: Неожиданная ошибка: {e}")
+                time.sleep(5)
+        
+        logging.info(f"Поток загрузки {thread_id} завершен")
+
+    def _save_progress(self):
+        """Save collected metadata"""
+        try:
+            with self.lock:
+                df = pd.DataFrame(self.collected)
+                df.to_csv(self.metadata_file, index=False)
+                
+                # Сохранение состояния статистики
+                stats_file = self.output_dir / "download_stats.txt"
+                with open(stats_file, 'w') as f:
+                    f.write(f"Всего найдено книг: {self.stats['searched']}\n")
+                    f.write(f"Попыток скачивания: {self.stats['attempted']}\n")
+                    f.write(f"Успешно скачано: {self.stats['downloaded']}\n")
+                    f.write(f"Исключено по автору: {self.stats['excluded_authors']}\n")
+                    f.write(f"Исключено по языку: {self.stats['excluded_language']}\n")
+                    f.write(f"Неудачных загрузок: {self.stats['failed']}\n")
+                    
+                    if self.stats['attempted'] > 0:
+                        success_rate = (self.stats['downloaded'] / self.stats['attempted']) * 100
+                        f.write(f"Успешность: {success_rate:.1f}%\n")
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении прогресса: {e}")
+
+    def run(self, start_year=1837, end_year=1945, target_count=2000, search_threads=3, download_threads=5):
+        """Run the parallel download process"""
+        logging.info(f"Запуск параллельной загрузки: {search_threads} поисковых потоков, {download_threads} потоков загрузки")
+        logging.info(f"Целевое количество книг: {target_count}, период: {start_year}-{end_year}")
+        
+        # Разбиваем годы на диапазоны для потоков
+        years_span = end_year - start_year
+        years_per_thread = years_span // search_threads
+        year_ranges = []
+        
+        for i in range(search_threads):
+            if i == search_threads - 1:
+                # Последний диапазон до конечного года
+                year_ranges.append((start_year + i * years_per_thread, end_year))
+            else:
+                year_ranges.append((start_year + i * years_per_thread, start_year + (i + 1) * years_per_thread - 1))
+        
+        # Запускаем поисковые потоки
+        search_threads_list = []
+        for i, years_range in enumerate(year_ranges):
+            thread = threading.Thread(
+                target=self.search_worker, 
+                args=(years_range, i+1),
+                name=f"Search-{i+1}",
+                daemon=True
+            )
+            thread.start()
+            search_threads_list.append(thread)
+        
+        # Запускаем потоки загрузки
+        download_threads_list = []
+        for i in range(download_threads):
+            thread = threading.Thread(
+                target=self.download_worker, 
+                args=(i+1,),
+                name=f"Download-{i+1}",
+                daemon=True
+            )
+            thread.start()
+            download_threads_list.append(thread)
+        
+        # Основной цикл с отображением прогресса
+        try:
+            with tqdm(total=target_count, desc="Загрузка книг") as pbar:
+                last_count = len(self.collected)
+                pbar.update(last_count)
+                
+                while len(self.collected) < target_count:
+                    time.sleep(5)
+                    current_count = len(self.collected)
+                    if current_count > last_count:
+                        pbar.update(current_count - last_count)
+                        last_count = current_count
+                        
+                    # Вывод промежуточной статистики
+                    if current_count % 10 == 0 and current_count > 0:
+                        logging.info(f"Прогресс: {current_count}/{target_count} книг ({(current_count/target_count)*100:.1f}%)")
+                        logging.info(f"Статистика: найдено={self.stats['searched']}, попытки={self.stats['attempted']}, успешно={self.stats['downloaded']}")
+                        self._save_progress()
+        
+        except KeyboardInterrupt:
+            logging.info("Прерывание пользователем. Сохранение прогресса...")
+            self._save_progress()
+            logging.info(f"Загружено {len(self.collected)} книг из {target_count}")
+        
+        # Сохраняем финальную статистику
+        self._save_progress()
+        self._save_final_statistics()
+        
+        logging.info(f"Загрузка завершена! Всего загружено: {len(self.collected)} книг")
+        return self.collected
+
+    def _save_final_statistics(self):
+        """Save final collection statistics"""
+        if not self.collected:
+            return
+            
+        try:
+            df = pd.DataFrame(self.collected)
+            
+            # Статистика авторов
+            author_counts = df['author'].value_counts()
+            top_authors = author_counts.head(20)
+            
+            # Статистика по годам
+            year_counts = df['year'].value_counts().sort_index()
+            decade_counts = df.assign(decade=(df['year'] // 10) * 10).groupby('decade')['book_id'].count().sort_index()
+            
+            # Сохранение статистики
+            stats_file = self.output_dir / "collection_stats.txt"
+            with open(stats_file, 'w', encoding='utf-8') as f:
+                f.write("СТАТИСТИКА КОЛЛЕКЦИИ АНГЛИЙСКОЙ ХУДОЖЕСТВЕННОЙ ЛИТЕРАТУРЫ\n")
+                f.write("=================================================\n\n")
+                
+                f.write(f"Всего книг: {len(df)}\n")
+                f.write(f"Общее количество слов: {df['word_count'].sum():,}\n")
+                f.write(f"Среднее количество слов: {int(df['word_count'].mean()):,}\n")
+                f.write(f"Диапазон лет: {df['year'].min()}-{df['year'].max()}\n")
+                f.write(f"Уникальных авторов: {len(df['author'].unique())}\n\n")
+                
+                f.write("Топ-20 авторов:\n")
+                for author, count in top_authors.items():
+                    f.write(f"  {author}: {count} книг\n")
+                
+                f.write("\nРаспределение по десятилетиям:\n")
+                for decade, count in decade_counts.items():
+                    f.write(f"  {decade}s: {count} книг\n")
+                
+                f.write("\nСтатистика процесса скачивания:\n")
+                for key, value in self.stats.items():
+                    f.write(f"  {key}: {value}\n")
+            
+            logging.info(f"Финальная статистика сохранена в {stats_file}")
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении статистики: {e}")
+
+def main():
+    downloader = ParallelBookDownloader(output_dir='english_fiction')
+    downloader.run(
+        start_year=1837,
+        end_year=1945,
+        target_count=2000,
+        search_threads=3,
+        download_threads=5
+    )
+
+if name == "__main__":
+    main()
